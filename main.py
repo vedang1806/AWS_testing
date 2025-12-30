@@ -28,6 +28,10 @@ from datetime import datetime
 from dotenv import load_dotenv
 import boto3
 from botocore.exceptions import ClientError
+import requests
+from pydub import AudioSegment
+from pydub.generators import Sine
+import numpy as np
 
 # Load environment variables
 load_dotenv()
@@ -151,6 +155,7 @@ class AWSTranscriber:
                     "ShowAlternatives": False,
                     "MaxSpeakerLabels": 2,
                     "ShowSpeakerLabels": True,
+                    "VocabularyFilterMethod": "mask",
                 },
             )
 
@@ -223,14 +228,21 @@ class AWSTranscriber:
             transcript_uri = job["Transcript"]["TranscriptFileUri"]
             print(f"\n📥 Downloading transcript from: {transcript_uri}")
 
-            # Extract bucket and key from S3 URI
-            s3_parts = transcript_uri.replace("s3://", "").split("/", 1)
-            bucket = s3_parts[0]
-            key = s3_parts[1]
+            # Check if it's an HTTPS URL or S3 URI
+            if transcript_uri.startswith("https://"):
+                # Download from HTTPS URL
+                response = requests.get(transcript_uri)
+                response.raise_for_status()
+                content = response.json()
+            else:
+                # Download from S3 URI (s3://bucket/key format)
+                s3_parts = transcript_uri.replace("s3://", "").split("/", 1)
+                bucket = s3_parts[0]
+                key = s3_parts[1]
 
-            # Download from S3
-            response = self.s3_client.get_object(Bucket=bucket, Key=key)
-            content = json.loads(response["Body"].read())
+                # Download from S3
+                response = self.s3_client.get_object(Bucket=bucket, Key=key)
+                content = json.loads(response["Body"].read())
 
             print(f"✅ Transcript downloaded successfully")
             return content
@@ -324,6 +336,91 @@ class PIIRedactor:
                 redacted_text = redacted_text[:begin] + placeholder + redacted_text[end:]
 
         return redacted_text
+
+    def redact_audio(self, audio_file_path: str,
+                     original_text: str,
+                     entities: List[Dict[str, Any]],
+                     beep_frequency: int = 1000,
+                     beep_duration: int = 100) -> Optional[bytes]:
+        """
+        Redact audio by replacing PII segments with beep sounds
+
+        Args:
+            audio_file_path: Path to the original audio file
+            original_text: Original transcript text
+            entities: List of PII entities with character offsets
+            beep_frequency: Frequency of beep in Hz (default 1000)
+            beep_duration: Duration of beep in ms (default 100)
+
+        Returns:
+            Redacted audio bytes or None if failed
+        """
+        try:
+            print(f"\n🔊 Redacting audio with beeps for {len(entities)} PII entities...")
+
+            if not entities:
+                print(f"   No PII entities to redact in audio")
+                return None
+
+            # Load audio file
+            audio = AudioSegment.from_wav(audio_file_path)
+            audio_duration_ms = len(audio)
+
+            # Get word-level timing if available (estimate from character offsets)
+            # Calculate character-to-time mapping based on speech rate
+            chars_per_second = len(original_text) / (audio_duration_ms / 1000)
+
+            print(f"   Audio duration: {audio_duration_ms / 1000:.2f} seconds")
+            print(f"   Estimated speech rate: {chars_per_second:.1f} chars/second")
+
+            # Create beep sound
+            beep = Sine(beep_frequency).to_audio_segment(duration=beep_duration)
+
+            # Sort entities by character offset (descending) to avoid offset shifting
+            sorted_entities = sorted(
+                entities,
+                key=lambda x: x["BeginOffset"],
+                reverse=True
+            )
+
+            # Replace PII segments with beeps
+            for entity in sorted_entities:
+                begin_char = entity.get("BeginOffset")
+                end_char = entity.get("EndOffset")
+                entity_type = entity.get("Type", "UNKNOWN")
+
+                if begin_char is not None and end_char is not None:
+                    # Estimate start and end times based on character positions
+                    start_ms = int((begin_char / chars_per_second) * 1000)
+                    end_ms = int((end_char / chars_per_second) * 1000)
+
+                    # Ensure times are within audio bounds
+                    start_ms = max(0, start_ms)
+                    end_ms = min(audio_duration_ms, end_ms)
+                    duration_ms = end_ms - start_ms
+
+                    if duration_ms > 0:
+                        # Create silence with beep duration
+                        silence = AudioSegment.silent(duration=duration_ms)
+                        # Overlay beeps throughout the segment
+                        num_beeps = max(1, duration_ms // (beep_duration + 50))
+                        for i in range(num_beeps):
+                            beep_pos = i * (duration_ms // num_beeps)
+                            silence = silence.overlay(beep, position=beep_pos)
+
+                        # Replace segment in audio
+                        audio = audio[:start_ms] + silence + audio[end_ms:]
+
+                        print(f"   ✓ Redacted {entity_type} at {start_ms}ms-{end_ms}ms")
+
+            # Convert to bytes
+            audio_bytes = audio.export(format="wav").read()
+            print(f"✅ Audio redaction completed")
+            return audio_bytes
+
+        except Exception as e:
+            print(f"❌ Error redacting audio: {e}")
+            return None
 
 
 class S3Manager:
@@ -450,9 +547,10 @@ def print_transcription_summary(transcript_content: Dict[str, Any],
     speaker_labels = results.get("speaker_labels", [])
     if speaker_labels:
         print(f"\n👥 Speaker Information:")
-        print(f"   Total speakers: {len(speaker_labels)}")
-        for speaker in speaker_labels:
-            print(f"      - Speaker {speaker['speaker_label']}")
+        unique_speakers = set(speaker_labels) if speaker_labels else set()
+        print(f"   Total speakers: {len(unique_speakers)}")
+        for speaker in sorted(unique_speakers):
+            print(f"      - {speaker}")
 
     print("\n" + "="*80)
 
@@ -561,6 +659,18 @@ Examples:
     # Step 6: Redact PII from text
     redacted_text = pii_redactor.redact_text(original_text, pii_entities)
 
+    # Step 7: Redact PII from audio with beeps
+    redacted_audio_bytes = pii_redactor.redact_audio(audio_file, original_text, pii_entities)
+
+    # Step 8: Upload redacted audio to S3
+    redacted_audio_s3_url = None
+    if redacted_audio_bytes:
+        redacted_audio_s3_url = s3_manager.upload_redacted_audio(
+            redacted_audio_bytes,
+            call_id,
+            audio_format="wav"
+        )
+
     # Print summary
     print_transcription_summary(transcript_content, pii_entities, redacted_text)
 
@@ -571,6 +681,7 @@ Examples:
         "original_transcript": original_text,
         "redacted_transcript": redacted_text,
         "pii_entities": pii_entities,
+        "redacted_audio_s3_url": redacted_audio_s3_url,
         "full_transcript_content": transcript_content,
     }
 
@@ -597,6 +708,10 @@ Examples:
     print(f"   Redacted transcript length: {len(redacted_text)} characters")
     print(f"   PII entities found: {len(pii_entities)}")
     print(f"   Original audio location: {s3_uri}")
+    if redacted_audio_s3_url:
+        print(f"   Redacted audio location: {redacted_audio_s3_url}")
+    else:
+        print(f"   Redacted audio location: Not uploaded (no PII found or error occurred)")
 
     print(f"\n{'='*80}\n")
 
