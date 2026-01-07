@@ -676,6 +676,7 @@ class GeminiSentimentAnalyzer:
     def extract_speaker_segments(self, transcript_content: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Extract speaker segments from AWS Transcribe results
+        Builds proper text with punctuation from items
 
         Args:
             transcript_content: Transcription job results from AWS Transcribe
@@ -691,7 +692,7 @@ class GeminiSentimentAnalyzer:
             speaker_labels = results.get("speaker_labels", {})
             segments_data = speaker_labels.get("segments", [])
 
-            # Build speaker segments with items
+            # Build speaker segments with proper text
             for segment in segments_data:
                 speaker = segment.get("speaker_label", "Unknown")
                 start_time = float(segment.get("start_time", 0))
@@ -700,26 +701,27 @@ class GeminiSentimentAnalyzer:
                 # Get items for this segment
                 segment_items = segment.get("items", [])
 
-                # Build text from items
-                words = []
-                for item in segment_items:
-                    item_start_time = float(item.get("start_time", 0))
+                # Build text by finding items in the time range
+                text_parts = []
+                for i, item in enumerate(items):
+                    item_type = item.get("type")
 
-                    # Find matching item in main items list
-                    for main_item in items:
-                        if (main_item.get("type") == "pronunciation" and
-                            float(main_item.get("start_time", 0)) == item_start_time):
-                            word = main_item.get("alternatives", [{}])[0].get("content", "")
-                            words.append(word)
-                            break
-                        elif main_item.get("type") == "punctuation":
-                            # Check if punctuation should be added
-                            if len(words) > 0:
-                                punct = main_item.get("alternatives", [{}])[0].get("content", "")
-                                if punct:
-                                    words[-1] = words[-1] + punct
+                    if item_type == "pronunciation":
+                        item_start = float(item.get("start_time", 0))
+                        item_end = float(item.get("end_time", 0))
 
-                text = " ".join(words)
+                        # Check if this item belongs to this segment
+                        if item_start >= start_time and item_end <= end_time:
+                            word = item.get("alternatives", [{}])[0].get("content", "")
+                            text_parts.append(word)
+
+                            # Check if next item is punctuation
+                            if i + 1 < len(items) and items[i + 1].get("type") == "punctuation":
+                                punct = items[i + 1].get("alternatives", [{}])[0].get("content", "")
+                                if punct and text_parts:
+                                    text_parts[-1] = text_parts[-1] + punct
+
+                text = " ".join(text_parts)
 
                 if text.strip():
                     segments.append({
@@ -736,35 +738,86 @@ class GeminiSentimentAnalyzer:
 
         return segments
 
-    def analyze_sentiment_with_gemini(self, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def merge_consecutive_segments(self, segments: List[Dict[str, Any]], max_gap: float = 2.0) -> List[Dict[str, Any]]:
         """
-        Analyze sentiment for each segment using Gemini API
+        Merge consecutive segments from the same speaker that are close together
 
         Args:
             segments: List of speaker segments
+            max_gap: Maximum gap in seconds between segments to merge
 
         Returns:
-            List of segments with sentiment analysis
+            List of merged segments
+        """
+        if not segments:
+            return segments
+
+        merged = []
+        current_segment = segments[0].copy()
+
+        for i in range(1, len(segments)):
+            segment = segments[i]
+
+            # Check if same speaker and within time gap
+            if (segment["speaker"] == current_segment["speaker"] and
+                segment["start_time"] - current_segment["end_time"] <= max_gap):
+                # Merge with current segment
+                current_segment["text"] += " " + segment["text"]
+                current_segment["end_time"] = segment["end_time"]
+            else:
+                # Save current and start new
+                merged.append(current_segment)
+                current_segment = segment.copy()
+
+        # Add the last segment
+        merged.append(current_segment)
+
+        return merged
+
+    def analyze_sentiment_with_gemini(self, segments: List[Dict[str, Any]], full_transcript: str = "", pii_entities: List[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """
+        Analyze sentiment for each segment using Gemini API
+        Uses original text for analysis but returns PII-redacted text in output
+
+        Args:
+            segments: List of speaker segments (with original text)
+            full_transcript: Full transcript text for PII redaction mapping
+            pii_entities: List of PII entities to redact from output text
+
+        Returns:
+            List of segments with sentiment analysis and PII-redacted text
         """
         print(f"\n🤖 Analyzing sentiment with Gemini AI for {len(segments)} segments...")
 
         analyzed_segments = []
 
         try:
-            # Prepare the prompt for Gemini
-            prompt = """You are a sentiment analysis expert. Analyze the following conversation segments and provide sentiment analysis for each one.
+            # Prepare the prompt for Gemini (using original text for better analysis)
+            prompt = """You are a call quality monitoring expert analyzing a customer service conversation. Your job is to identify problems, compliance issues, and professionalism concerns.
 
-For each segment, provide:
+IMPORTANT CONTEXT:
+- Agent (spk_0): Customer service representative - should maintain professionalism, protect privacy, follow procedures
+- Customer (spk_1): Caller seeking help - may show frustration when service is poor
+
+For each segment, analyze:
 1. sentiment: "positive", "negative", or "neutral"
-2. confidence: a float between 0 and 1 indicating confidence level
-3. tone_note: a brief description of the tone (e.g., "Professional and welcoming", "Frustrated and concerned", "Neutral tone")
+2. confidence: float between 0.0-1.0
+3. tone_note: Detailed description that identifies:
+   - For AGENTS: Note any unprofessional behavior, privacy violations (mentioning other patients' info), procedural errors, dismissive attitudes, or security concerns
+   - For CUSTOMERS: Note if frustration/anger is justified reaction to poor service, or if showing patience, concern, cooperation
+   - Be specific about WHAT the problem is (e.g., "Sharing another patient's name - HIPAA violation", "Refusing to follow customer's explicit request", "Justifiably frustrated by agent's unprofessional conduct")
 
-Return the response as a JSON array with the same order as the input segments.
+Examples of good tone_notes:
+- Agent: "Extremely unprofessional - discussing another patient's medical procedure by name (privacy violation)"
+- Agent: "Dismissive of customer's privacy concerns and security requests"
+- Customer: "Angry and demanding accountability - justified response to multiple privacy breaches"
+- Customer: "Cooperative and providing required information"
+- Agent: "Professional and welcoming greeting"
 
 Conversation segments:
 """
 
-            # Add segments to prompt
+            # Add segments to prompt (using original text)
             for i, segment in enumerate(segments, 1):
                 prompt += f"\n{i}. [{segment['speaker']}]: {segment['text']}"
 
@@ -803,13 +856,25 @@ Return ONLY a valid JSON array in this exact format, with no additional text:
 
             # Combine segments with sentiment analysis
             for i, segment in enumerate(segments):
+                # Redact PII from segment text if entities provided
+                segment_text = segment["text"]
+                if pii_entities and full_transcript:
+                    segment_text = self._redact_segment_text(segment_text, full_transcript, pii_entities)
+
+                # Map speaker labels to Agent/Customer
+                speaker_label = segment["speaker"].replace("spk_", "Speaker ")
+                if "0" in speaker_label or speaker_label == "Speaker 0":
+                    speaker_label = "Agent"
+                elif "1" in speaker_label or speaker_label == "Speaker 1":
+                    speaker_label = "Customer"
+
                 if i < len(sentiment_results):
                     sentiment_data = sentiment_results[i]
 
                     analyzed_segment = {
                         "order": i + 1,
-                        "speaker": segment["speaker"].replace("spk_", "Speaker "),
-                        "text": segment["text"],
+                        "speaker": speaker_label,
+                        "text": segment_text,
                         "start_time": self.format_time(segment["start_time"]),
                         "end_time": self.format_time(segment["end_time"]),
                         "sentiment": sentiment_data.get("sentiment", "neutral"),
@@ -822,8 +887,8 @@ Return ONLY a valid JSON array in this exact format, with no additional text:
                     # Fallback if Gemini doesn't return enough results
                     analyzed_segment = {
                         "order": i + 1,
-                        "speaker": segment["speaker"].replace("spk_", "Speaker "),
-                        "text": segment["text"],
+                        "speaker": speaker_label,
+                        "text": segment_text,
                         "start_time": self.format_time(segment["start_time"]),
                         "end_time": self.format_time(segment["end_time"]),
                         "sentiment": "neutral",
@@ -842,10 +907,22 @@ Return ONLY a valid JSON array in this exact format, with no additional text:
 
             # Fallback: return segments with neutral sentiment
             for i, segment in enumerate(segments):
+                # Redact PII from segment text if entities provided
+                segment_text = segment["text"]
+                if pii_entities and full_transcript:
+                    segment_text = self._redact_segment_text(segment_text, full_transcript, pii_entities)
+
+                # Map speaker labels to Agent/Customer
+                speaker_label = segment["speaker"].replace("spk_", "Speaker ")
+                if "0" in speaker_label or speaker_label == "Speaker 0":
+                    speaker_label = "Agent"
+                elif "1" in speaker_label or speaker_label == "Speaker 1":
+                    speaker_label = "Customer"
+
                 analyzed_segment = {
                     "order": i + 1,
-                    "speaker": segment["speaker"].replace("spk_", "Speaker "),
-                    "text": segment["text"],
+                    "speaker": speaker_label,
+                    "text": segment_text,
                     "start_time": self.format_time(segment["start_time"]),
                     "end_time": self.format_time(segment["end_time"]),
                     "sentiment": "neutral",
@@ -856,6 +933,73 @@ Return ONLY a valid JSON array in this exact format, with no additional text:
                 analyzed_segments.append(analyzed_segment)
 
         return analyzed_segments
+
+    def _redact_segment_text(self, segment_text: str, full_transcript: str, pii_entities: List[Dict[str, Any]]) -> str:
+        """
+        Redact PII entities from text segment by finding segment position in full transcript
+
+        Args:
+            segment_text: Text from this specific segment
+            full_transcript: Full transcript text
+            pii_entities: List of PII entities from the full transcript
+
+        Returns:
+            Text with PII redacted using [ENTITY_TYPE] format
+        """
+        if not pii_entities or not segment_text:
+            return segment_text
+
+        # Find this segment's position in the full transcript (case-insensitive, handle spaces)
+        normalized_full = " ".join(full_transcript.split())
+        normalized_segment = " ".join(segment_text.split())
+
+        segment_start = normalized_full.lower().find(normalized_segment.lower())
+        if segment_start == -1:
+            # Segment not found, return as-is
+            return segment_text
+
+        segment_end = segment_start + len(normalized_segment)
+
+        # Collect entities that overlap with this segment
+        overlapping_entities = []
+        for entity in pii_entities:
+            entity_begin = entity.get("BeginOffset", 0)
+            entity_end = entity.get("EndOffset", 0)
+
+            # Check if entity overlaps with this segment
+            if entity_begin < segment_end and entity_end > segment_start:
+                # Calculate relative position within segment
+                rel_begin = max(0, entity_begin - segment_start)
+                rel_end = min(len(normalized_segment), entity_end - segment_start)
+
+                # Get entity text from full transcript
+                entity_text = normalized_full[entity_begin:entity_end]
+                entity_type = entity.get("Type", "UNKNOWN")
+
+                overlapping_entities.append({
+                    "text": entity_text,
+                    "type": entity_type,
+                    "rel_begin": rel_begin,
+                    "rel_end": rel_end
+                })
+
+        # Sort by position (descending) to avoid offset issues
+        overlapping_entities.sort(key=lambda x: x["rel_begin"], reverse=True)
+
+        # Apply redactions
+        redacted = normalized_segment
+        for entity in overlapping_entities:
+            entity_text = entity["text"]
+            entity_type = entity["type"]
+            placeholder = f"[{entity_type}]"
+
+            # Replace entity text with placeholder (case-insensitive)
+            # Find all occurrences in the segment
+            import re
+            pattern = re.escape(entity_text)
+            redacted = re.sub(pattern, placeholder, redacted, count=1, flags=re.IGNORECASE)
+
+        return redacted
 
 
 class S3Manager:
@@ -1027,14 +1171,10 @@ Examples:
         help="Save redacted transcript to text file",
     )
 
-    parser.add_argument(
-        "--redaction-mode",
-        default="silence",
-        choices=["silence", "beep", "white_noise", "pink_noise", "tone", "mute"],
-        help="Audio redaction method (default: silence)",
-    )
-
     args = parser.parse_args()
+
+    # Set redaction mode to tone (fixed)
+    args.redaction_mode = "tone"
 
     # Validate inputs
     if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
@@ -1111,8 +1251,20 @@ Examples:
     print("🎭 SENTIMENT ANALYSIS WITH GEMINI")
     print("="*80)
 
+    # Extract speaker segments (with original text)
     speaker_segments = gemini_analyzer.extract_speaker_segments(transcript_content)
-    sentiment_analysis_results = gemini_analyzer.analyze_sentiment_with_gemini(speaker_segments)
+
+    # Merge consecutive segments from same speaker for better context
+    print(f"   Original segments: {len(speaker_segments)}")
+    merged_segments = gemini_analyzer.merge_consecutive_segments(speaker_segments, max_gap=2.0)
+    print(f"   Merged segments: {len(merged_segments)}")
+
+    # Analyze sentiment using original text, but output will have PII redacted
+    sentiment_analysis_results = gemini_analyzer.analyze_sentiment_with_gemini(
+        merged_segments,
+        full_transcript=original_text,
+        pii_entities=pii_entities
+    )
 
     # Save sentiment analysis results to JSON file
     sentiment_file = f"sentiment_analysis_{call_id}.json"
