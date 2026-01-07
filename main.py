@@ -32,6 +32,7 @@ import requests
 from pydub import AudioSegment
 from pydub.generators import Sine
 import numpy as np
+import google.generativeai as genai
 
 # Load environment variables
 load_dotenv()
@@ -42,6 +43,7 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_S3_BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME", "bpo-box-dev")
 AWS_S3_REGION = os.getenv("AWS_S3_REGION", "us-east-1")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "DEV")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # PII Entity Types to Detect (AWS Comprehend)
 PII_ENTITY_TYPES = [
@@ -251,6 +253,32 @@ class AWSTranscriber:
             print(f"❌ Error downloading transcript: {e}")
             return None
 
+    def delete_transcription_job(self, job_name: str) -> bool:
+        """
+        Delete a completed transcription job from AWS Transcribe
+
+        Args:
+            job_name: Name of the transcription job to delete
+
+        Returns:
+            True if successful, False otherwise
+        """
+        print(f"\n🗑️  Deleting transcription job: {job_name}")
+
+        try:
+            self.transcribe_client.delete_transcription_job(
+                TranscriptionJobName=job_name
+            )
+            print(f"✅ Transcription job deleted successfully")
+            return True
+
+        except ClientError as e:
+            print(f"❌ Failed to delete transcription job: {e}")
+            return False
+        except Exception as e:
+            print(f"❌ Error deleting transcription job: {e}")
+            return False
+
 
 class PIIRedactor:
     """
@@ -337,44 +365,145 @@ class PIIRedactor:
 
         return redacted_text
 
+    def extract_word_timings(self, transcript_content: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Extract word-level timing information from AWS Transcribe results
+
+        Args:
+            transcript_content: Transcription job results from AWS Transcribe
+
+        Returns:
+            List of words with timing information
+        """
+        words = []
+        try:
+            results = transcript_content.get("results", {})
+            items = results.get("items", [])
+
+            for item in items:
+                if item.get("type") == "pronunciation":
+                    word_data = {
+                        "word": item.get("alternatives", [{}])[0].get("content", ""),
+                        "start_time": float(item.get("start_time", 0)),
+                        "end_time": float(item.get("end_time", 0)),
+                        "confidence": float(item.get("alternatives", [{}])[0].get("confidence", 1.0)),
+                    }
+                    words.append(word_data)
+        except Exception as e:
+            print(f"   Warning: Could not extract word timings: {e}")
+
+        return words
+
+    def map_character_to_time(self, text: str, words: List[Dict[str, Any]]) -> Optional[Dict[int, float]]:
+        """
+        Create a mapping of character offsets to audio timestamps using word-level timing
+
+        Args:
+            text: Full transcript text
+            words: List of words with timing info
+
+        Returns:
+            Dictionary mapping character offset to timestamp (in ms)
+        """
+        char_to_time = {}
+
+        if not words:
+            return None
+
+        current_char_pos = 0
+
+        for word_info in words:
+            word = word_info.get("word", "").lower()
+            start_time_s = word_info.get("start_time", 0)
+            end_time_s = word_info.get("end_time", 0)
+
+            # Find word in remaining text (case-insensitive)
+            remaining_text = text[current_char_pos:].lower()
+            word_pos = remaining_text.find(word)
+
+            if word_pos != -1:
+                # Map character positions to timestamps
+                word_start_char = current_char_pos + word_pos
+                word_end_char = word_start_char + len(word)
+
+                # Linear interpolation for characters within word
+                for char_offset in range(word_start_char, word_end_char):
+                    if word_end_char > word_start_char:
+                        # Interpolate timestamp based on position within word
+                        progress = (char_offset - word_start_char) / (word_end_char - word_start_char)
+                        timestamp_s = start_time_s + progress * (end_time_s - start_time_s)
+                        char_to_time[char_offset] = timestamp_s * 1000  # Convert to ms
+                    else:
+                        char_to_time[char_offset] = start_time_s * 1000
+
+                current_char_pos = word_end_char
+
+        return char_to_time if char_to_time else None
+
     def redact_audio(self, audio_file_path: str,
                      original_text: str,
                      entities: List[Dict[str, Any]],
+                     transcript_content: Optional[Dict[str, Any]] = None,
+                     redaction_mode: str = "silence",
                      beep_frequency: int = 1000,
                      beep_duration: int = 100) -> Optional[bytes]:
         """
-        Redact audio by replacing PII segments with beep sounds
+        Redact audio by replacing PII segments with different methods
 
         Args:
             audio_file_path: Path to the original audio file
             original_text: Original transcript text
             entities: List of PII entities with character offsets
-            beep_frequency: Frequency of beep in Hz (default 1000)
+            transcript_content: Full AWS Transcribe response for word-level timing
+            redaction_mode: Redaction method - 'silence', 'beep', 'white_noise', 'pink_noise', 'tone', 'mute'
+            beep_frequency: Frequency of beep/tone in Hz (default 1000)
             beep_duration: Duration of beep in ms (default 100)
 
         Returns:
             Redacted audio bytes or None if failed
         """
         try:
-            print(f"\n🔊 Redacting audio with beeps for {len(entities)} PII entities...")
+            print(f"\n🔊 Redacting audio ({redaction_mode} mode) for {len(entities)} PII entities...")
 
             if not entities:
                 print(f"   No PII entities to redact in audio")
                 return None
 
-            # Load audio file
-            audio = AudioSegment.from_wav(audio_file_path)
+            # Load audio file - auto-detect format
+            print(f"   Loading audio file: {audio_file_path}")
+            try:
+                audio = AudioSegment.from_file(audio_file_path)
+            except Exception as e:
+                print(f"⚠️  Could not load audio file: {e}")
+                print(f"   Trying alternative format detection...")
+                # Try explicit format detection
+                file_ext = Path(audio_file_path).suffix.lower().lstrip('.')
+                if file_ext:
+                    try:
+                        audio = AudioSegment.from_file(audio_file_path, format=file_ext)
+                    except Exception as e2:
+                        print(f"❌ Failed to load audio: {e2}")
+                        return None
+                else:
+                    return None
+
             audio_duration_ms = len(audio)
 
-            # Get word-level timing if available (estimate from character offsets)
-            # Calculate character-to-time mapping based on speech rate
-            chars_per_second = len(original_text) / (audio_duration_ms / 1000)
-
             print(f"   Audio duration: {audio_duration_ms / 1000:.2f} seconds")
-            print(f"   Estimated speech rate: {chars_per_second:.1f} chars/second")
 
-            # Create beep sound
-            beep = Sine(beep_frequency).to_audio_segment(duration=beep_duration)
+            # Try to use word-level timing from AWS Transcribe
+            char_to_time = None
+            if transcript_content:
+                words = self.extract_word_timings(transcript_content)
+                if words:
+                    print(f"   Using precise word-level timing ({len(words)} words detected)")
+                    char_to_time = self.map_character_to_time(original_text, words)
+
+            # Fallback to linear estimation if word timing unavailable
+            if char_to_time is None:
+                print(f"   Using linear character-to-time estimation (less accurate)")
+                chars_per_second = len(original_text) / (audio_duration_ms / 1000)
+                print(f"   Estimated speech rate: {chars_per_second:.1f} chars/second")
 
             # Sort entities by character offset (descending) to avoid offset shifting
             sorted_entities = sorted(
@@ -383,35 +512,104 @@ class PIIRedactor:
                 reverse=True
             )
 
-            # Replace PII segments with beeps
+            # Replace PII segments based on mode
             for entity in sorted_entities:
                 begin_char = entity.get("BeginOffset")
                 end_char = entity.get("EndOffset")
                 entity_type = entity.get("Type", "UNKNOWN")
+                confidence = entity.get("Score", 1.0)
 
                 if begin_char is not None and end_char is not None:
-                    # Estimate start and end times based on character positions
-                    start_ms = int((begin_char / chars_per_second) * 1000)
-                    end_ms = int((end_char / chars_per_second) * 1000)
+                    # Get timing information
+                    if char_to_time:
+                        # Use precise word-level timing
+                        start_ms = char_to_time.get(begin_char)
+                        end_ms = char_to_time.get(end_char)
+
+                        # Fallback: find closest character times
+                        if start_ms is None:
+                            for offset in range(begin_char, end_char):
+                                if offset in char_to_time:
+                                    start_ms = char_to_time[offset]
+                                    break
+                        if end_ms is None:
+                            for offset in range(end_char - 1, begin_char - 1, -1):
+                                if offset in char_to_time:
+                                    end_ms = char_to_time[offset]
+                                    break
+
+                        if start_ms is None or end_ms is None:
+                            # Fallback to linear estimation
+                            chars_per_second = len(original_text) / (audio_duration_ms / 1000)
+                            start_ms = int((begin_char / chars_per_second) * 1000)
+                            end_ms = int((end_char / chars_per_second) * 1000)
+                    else:
+                        # Linear estimation
+                        chars_per_second = len(original_text) / (audio_duration_ms / 1000)
+                        start_ms = int((begin_char / chars_per_second) * 1000)
+                        end_ms = int((end_char / chars_per_second) * 1000)
 
                     # Ensure times are within audio bounds
-                    start_ms = max(0, start_ms)
-                    end_ms = min(audio_duration_ms, end_ms)
+                    start_ms = max(0, int(start_ms))
+                    end_ms = min(audio_duration_ms, int(end_ms))
                     duration_ms = end_ms - start_ms
 
-                    if duration_ms > 0:
-                        # Create silence with beep duration
-                        silence = AudioSegment.silent(duration=duration_ms)
-                        # Overlay beeps throughout the segment
-                        num_beeps = max(1, duration_ms // (beep_duration + 50))
-                        for i in range(num_beeps):
-                            beep_pos = i * (duration_ms // num_beeps)
-                            silence = silence.overlay(beep, position=beep_pos)
+                    if duration_ms > 50:  # Only redact if segment is long enough
+                        # Create redaction segment based on mode
+                        if redaction_mode == "silence":
+                            # Complete silence
+                            redaction_segment = AudioSegment.silent(duration=duration_ms)
+
+                        elif redaction_mode == "beep":
+                            # Beep sounds
+                            beep = Sine(beep_frequency).to_audio_segment(duration=beep_duration)
+                            redaction_segment = AudioSegment.silent(duration=duration_ms)
+                            num_beeps = max(1, duration_ms // (beep_duration + 100))
+                            for i in range(num_beeps):
+                                beep_pos = i * (duration_ms // num_beeps)
+                                redaction_segment = redaction_segment.overlay(
+                                    beep,
+                                    position=min(beep_pos, duration_ms - beep_duration)
+                                )
+
+                        elif redaction_mode == "white_noise":
+                            # White noise (random sound)
+                            noise = self._generate_white_noise(duration_ms)
+                            redaction_segment = noise - 12  # Reduce volume for subtlety
+
+                        elif redaction_mode == "pink_noise":
+                            # Pink noise (softer, more natural)
+                            noise = self._generate_pink_noise(duration_ms)
+                            redaction_segment = noise - 12  # Reduce volume
+
+                        elif redaction_mode == "tone":
+                            # Single continuous tone
+                            tone = Sine(beep_frequency).to_audio_segment(duration=duration_ms)
+                            redaction_segment = tone - 15  # Reduce volume
+
+                        elif redaction_mode == "mute":
+                            # Gradual fade to silence
+                            redaction_segment = AudioSegment.silent(duration=duration_ms)
+                            # Apply fade out effect
+                            fade_duration = min(100, duration_ms // 3)
+                            original_segment = audio[start_ms:end_ms]
+                            if len(original_segment) > fade_duration * 2:
+                                redaction_segment = (
+                                    original_segment[:fade_duration].fade_out(fade_duration) +
+                                    AudioSegment.silent(duration=max(0, duration_ms - fade_duration * 2)) +
+                                    original_segment[-fade_duration:].fade_in(fade_duration)
+                                )
+                            else:
+                                redaction_segment = original_segment.fade_out(duration_ms // 2)
+
+                        else:
+                            # Default to silence
+                            redaction_segment = AudioSegment.silent(duration=duration_ms)
 
                         # Replace segment in audio
-                        audio = audio[:start_ms] + silence + audio[end_ms:]
+                        audio = audio[:start_ms] + redaction_segment + audio[end_ms:]
 
-                        print(f"   ✓ Redacted {entity_type} at {start_ms}ms-{end_ms}ms")
+                        print(f"   ✓ Redacted {entity_type} ({confidence:.1%}) at {start_ms}ms-{end_ms}ms")
 
             # Convert to bytes
             audio_bytes = audio.export(format="wav").read()
@@ -420,7 +618,244 @@ class PIIRedactor:
 
         except Exception as e:
             print(f"❌ Error redacting audio: {e}")
+            import traceback
+            traceback.print_exc()
             return None
+
+    def _generate_white_noise(self, duration_ms: int) -> AudioSegment:
+        """Generate white noise for redaction"""
+        sample_rate = 44100
+        duration_s = duration_ms / 1000
+        samples = np.random.randint(-32768, 32767, int(sample_rate * duration_s), dtype=np.int16)
+        return AudioSegment(
+            samples.tobytes(),
+            frame_rate=sample_rate,
+            sample_width=2,
+            channels=1
+        )
+
+    def _generate_pink_noise(self, duration_ms: int) -> AudioSegment:
+        """Generate pink noise (1/f noise) for redaction"""
+        sample_rate = 44100
+        duration_s = duration_ms / 1000
+        num_samples = int(sample_rate * duration_s)
+
+        # Generate pink noise using simple algorithm
+        white = np.random.randn(num_samples)
+        # Simple pink noise filter (not perfect but good enough)
+        pink = np.convolve(white, [0.049922035, -0.095993537, 0.050612699, -0.004408786], mode='same')
+
+        # Normalize to 16-bit range
+        pink = pink / np.max(np.abs(pink)) * 32767
+        pink = pink.astype(np.int16)
+
+        return AudioSegment(
+            pink.tobytes(),
+            frame_rate=sample_rate,
+            sample_width=2,
+            channels=1
+        )
+
+
+class GeminiSentimentAnalyzer:
+    """
+    Handles sentiment analysis using Google Gemini API
+    """
+
+    def __init__(self, api_key: str):
+        """Initialize Gemini API client"""
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel('gemini-pro')
+
+    def format_time(self, seconds: float) -> str:
+        """Convert seconds to MM:SS format"""
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes:02d}:{secs:02d}"
+
+    def extract_speaker_segments(self, transcript_content: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Extract speaker segments from AWS Transcribe results
+
+        Args:
+            transcript_content: Transcription job results from AWS Transcribe
+
+        Returns:
+            List of speaker segments with text and timing
+        """
+        segments = []
+
+        try:
+            results = transcript_content.get("results", {})
+            items = results.get("items", [])
+            speaker_labels = results.get("speaker_labels", {})
+            segments_data = speaker_labels.get("segments", [])
+
+            # Build speaker segments with items
+            for segment in segments_data:
+                speaker = segment.get("speaker_label", "Unknown")
+                start_time = float(segment.get("start_time", 0))
+                end_time = float(segment.get("end_time", 0))
+
+                # Get items for this segment
+                segment_items = segment.get("items", [])
+
+                # Build text from items
+                words = []
+                for item in segment_items:
+                    item_start_time = float(item.get("start_time", 0))
+
+                    # Find matching item in main items list
+                    for main_item in items:
+                        if (main_item.get("type") == "pronunciation" and
+                            float(main_item.get("start_time", 0)) == item_start_time):
+                            word = main_item.get("alternatives", [{}])[0].get("content", "")
+                            words.append(word)
+                            break
+                        elif main_item.get("type") == "punctuation":
+                            # Check if punctuation should be added
+                            if len(words) > 0:
+                                punct = main_item.get("alternatives", [{}])[0].get("content", "")
+                                if punct:
+                                    words[-1] = words[-1] + punct
+
+                text = " ".join(words)
+
+                if text.strip():
+                    segments.append({
+                        "speaker": speaker,
+                        "text": text.strip(),
+                        "start_time": start_time,
+                        "end_time": end_time
+                    })
+
+        except Exception as e:
+            print(f"❌ Error extracting speaker segments: {e}")
+            import traceback
+            traceback.print_exc()
+
+        return segments
+
+    def analyze_sentiment_with_gemini(self, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Analyze sentiment for each segment using Gemini API
+
+        Args:
+            segments: List of speaker segments
+
+        Returns:
+            List of segments with sentiment analysis
+        """
+        print(f"\n🤖 Analyzing sentiment with Gemini AI for {len(segments)} segments...")
+
+        analyzed_segments = []
+
+        try:
+            # Prepare the prompt for Gemini
+            prompt = """You are a sentiment analysis expert. Analyze the following conversation segments and provide sentiment analysis for each one.
+
+For each segment, provide:
+1. sentiment: "positive", "negative", or "neutral"
+2. confidence: a float between 0 and 1 indicating confidence level
+3. tone_note: a brief description of the tone (e.g., "Professional and welcoming", "Frustrated and concerned", "Neutral tone")
+
+Return the response as a JSON array with the same order as the input segments.
+
+Conversation segments:
+"""
+
+            # Add segments to prompt
+            for i, segment in enumerate(segments, 1):
+                prompt += f"\n{i}. [{segment['speaker']}]: {segment['text']}"
+
+            prompt += """
+
+Return ONLY a valid JSON array in this exact format, with no additional text:
+[
+  {
+    "sentiment": "neutral",
+    "confidence": 0.9,
+    "tone_note": "Professional and welcoming"
+  },
+  ...
+]
+"""
+
+            # Call Gemini API
+            print("   Sending request to Gemini API...")
+            response = self.model.generate_content(prompt)
+
+            # Parse response
+            response_text = response.text.strip()
+
+            # Extract JSON from response (handle markdown code blocks)
+            if "```json" in response_text:
+                json_start = response_text.find("```json") + 7
+                json_end = response_text.find("```", json_start)
+                response_text = response_text[json_start:json_end].strip()
+            elif "```" in response_text:
+                json_start = response_text.find("```") + 3
+                json_end = response_text.find("```", json_start)
+                response_text = response_text[json_start:json_end].strip()
+
+            # Parse JSON
+            sentiment_results = json.loads(response_text)
+
+            # Combine segments with sentiment analysis
+            for i, segment in enumerate(segments):
+                if i < len(sentiment_results):
+                    sentiment_data = sentiment_results[i]
+
+                    analyzed_segment = {
+                        "order": i + 1,
+                        "speaker": segment["speaker"].replace("spk_", "Speaker "),
+                        "text": segment["text"],
+                        "start_time": self.format_time(segment["start_time"]),
+                        "end_time": self.format_time(segment["end_time"]),
+                        "sentiment": sentiment_data.get("sentiment", "neutral"),
+                        "confidence": sentiment_data.get("confidence", 0.9),
+                        "tone_note": sentiment_data.get("tone_note", "Neutral tone")
+                    }
+
+                    analyzed_segments.append(analyzed_segment)
+                else:
+                    # Fallback if Gemini doesn't return enough results
+                    analyzed_segment = {
+                        "order": i + 1,
+                        "speaker": segment["speaker"].replace("spk_", "Speaker "),
+                        "text": segment["text"],
+                        "start_time": self.format_time(segment["start_time"]),
+                        "end_time": self.format_time(segment["end_time"]),
+                        "sentiment": "neutral",
+                        "confidence": 0.9,
+                        "tone_note": "Neutral tone"
+                    }
+
+                    analyzed_segments.append(analyzed_segment)
+
+            print(f"✅ Sentiment analysis completed for {len(analyzed_segments)} segments")
+
+        except Exception as e:
+            print(f"❌ Error analyzing sentiment with Gemini: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Fallback: return segments with neutral sentiment
+            for i, segment in enumerate(segments):
+                analyzed_segment = {
+                    "order": i + 1,
+                    "speaker": segment["speaker"].replace("spk_", "Speaker "),
+                    "text": segment["text"],
+                    "start_time": self.format_time(segment["start_time"]),
+                    "end_time": self.format_time(segment["end_time"]),
+                    "sentiment": "neutral",
+                    "confidence": 0.9,
+                    "tone_note": "Neutral tone"
+                }
+
+                analyzed_segments.append(analyzed_segment)
+
+        return analyzed_segments
 
 
 class S3Manager:
@@ -592,11 +1027,22 @@ Examples:
         help="Save redacted transcript to text file",
     )
 
+    parser.add_argument(
+        "--redaction-mode",
+        default="silence",
+        choices=["silence", "beep", "white_noise", "pink_noise", "tone", "mute"],
+        help="Audio redaction method (default: silence)",
+    )
+
     args = parser.parse_args()
 
     # Validate inputs
     if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
         print("❌ Error: AWS credentials not set in environment")
+        sys.exit(1)
+
+    if not GEMINI_API_KEY:
+        print("❌ Error: GEMINI_API_KEY not set in environment")
         sys.exit(1)
 
     audio_file = args.audio_file
@@ -617,6 +1063,7 @@ Examples:
     # Initialize AWS services
     transcriber = AWSTranscriber()
     pii_redactor = PIIRedactor()
+    gemini_analyzer = GeminiSentimentAnalyzer(api_key=GEMINI_API_KEY)
     s3_manager = S3Manager(
         access_key=AWS_ACCESS_KEY_ID,
         secret_key=AWS_SECRET_ACCESS_KEY,
@@ -659,8 +1106,38 @@ Examples:
     # Step 6: Redact PII from text
     redacted_text = pii_redactor.redact_text(original_text, pii_entities)
 
-    # Step 7: Redact PII from audio with beeps
-    redacted_audio_bytes = pii_redactor.redact_audio(audio_file, original_text, pii_entities)
+    # Step 6.5: Extract speaker segments and analyze sentiment with Gemini
+    print("\n" + "="*80)
+    print("🎭 SENTIMENT ANALYSIS WITH GEMINI")
+    print("="*80)
+
+    speaker_segments = gemini_analyzer.extract_speaker_segments(transcript_content)
+    sentiment_analysis_results = gemini_analyzer.analyze_sentiment_with_gemini(speaker_segments)
+
+    # Save sentiment analysis results to JSON file
+    sentiment_file = f"sentiment_analysis_{call_id}.json"
+    with open(sentiment_file, "w") as f:
+        json.dump(sentiment_analysis_results, f, indent=2)
+    print(f"\n✅ Sentiment analysis saved to: {sentiment_file}")
+
+    # Print preview of sentiment analysis
+    print(f"\n📊 Sentiment Analysis Preview (first 3 segments):")
+    for segment in sentiment_analysis_results[:3]:
+        print(f"\n   Order: {segment['order']}")
+        print(f"   Speaker: {segment['speaker']}")
+        print(f"   Text: {segment['text'][:100]}...")
+        print(f"   Time: {segment['start_time']} - {segment['end_time']}")
+        print(f"   Sentiment: {segment['sentiment']} (confidence: {segment['confidence']:.2f})")
+        print(f"   Tone: {segment['tone_note']}")
+
+    # Step 7: Redact PII from audio
+    redacted_audio_bytes = pii_redactor.redact_audio(
+        audio_file,
+        original_text,
+        pii_entities,
+        transcript_content=transcript_content,  # Pass transcript for word-level timing
+        redaction_mode=args.redaction_mode  # Use user's chosen redaction method
+    )
 
     # Step 8: Upload redacted audio to S3
     redacted_audio_s3_url = None
@@ -682,6 +1159,7 @@ Examples:
         "redacted_transcript": redacted_text,
         "pii_entities": pii_entities,
         "redacted_audio_s3_url": redacted_audio_s3_url,
+        "sentiment_analysis": sentiment_analysis_results,
         "full_transcript_content": transcript_content,
     }
 
@@ -697,6 +1175,9 @@ Examples:
             f.write(redacted_text)
         print(f"✅ Redacted transcript saved to: {redacted_file}")
 
+    # Step 9: Delete the transcription job
+    transcriber.delete_transcription_job(job_name)
+
     # Final Results
     print(f"\n{'='*80}")
     print(f"✅ TEST COMPLETED SUCCESSFULLY")
@@ -707,6 +1188,8 @@ Examples:
     print(f"   Original transcript length: {len(original_text)} characters")
     print(f"   Redacted transcript length: {len(redacted_text)} characters")
     print(f"   PII entities found: {len(pii_entities)}")
+    print(f"   Speaker segments analyzed: {len(sentiment_analysis_results)}")
+    print(f"   Sentiment analysis file: {sentiment_file}")
     print(f"   Original audio location: {s3_uri}")
     if redacted_audio_s3_url:
         print(f"   Redacted audio location: {redacted_audio_s3_url}")
