@@ -1247,41 +1247,6 @@ Examples:
     redacted_text = pii_redactor.redact_text(original_text, pii_entities)
 
     # Step 6.5: Extract speaker segments and analyze sentiment with Gemini
-    print("\n" + "="*80)
-    print("🎭 SENTIMENT ANALYSIS WITH GEMINI")
-    print("="*80)
-
-    # Extract speaker segments (with original text)
-    speaker_segments = gemini_analyzer.extract_speaker_segments(transcript_content)
-
-    # Merge consecutive segments from same speaker for better context
-    print(f"   Original segments: {len(speaker_segments)}")
-    merged_segments = gemini_analyzer.merge_consecutive_segments(speaker_segments, max_gap=2.0)
-    print(f"   Merged segments: {len(merged_segments)}")
-
-    # Analyze sentiment using original text, but output will have PII redacted
-    sentiment_analysis_results = gemini_analyzer.analyze_sentiment_with_gemini(
-        merged_segments,
-        full_transcript=original_text,
-        pii_entities=pii_entities
-    )
-
-    # Save sentiment analysis results to JSON file
-    sentiment_file = f"sentiment_analysis_{call_id}.json"
-    with open(sentiment_file, "w") as f:
-        json.dump(sentiment_analysis_results, f, indent=2)
-    print(f"\n✅ Sentiment analysis saved to: {sentiment_file}")
-
-    # Print preview of sentiment analysis
-    print(f"\n📊 Sentiment Analysis Preview (first 3 segments):")
-    for segment in sentiment_analysis_results[:3]:
-        print(f"\n   Order: {segment['order']}")
-        print(f"   Speaker: {segment['speaker']}")
-        print(f"   Text: {segment['text'][:100]}...")
-        print(f"   Time: {segment['start_time']} - {segment['end_time']}")
-        print(f"   Sentiment: {segment['sentiment']} (confidence: {segment['confidence']:.2f})")
-        print(f"   Tone: {segment['tone_note']}")
-
     # Step 7: Redact PII from audio
     redacted_audio_bytes = pii_redactor.redact_audio(
         audio_file,
@@ -1311,7 +1276,6 @@ Examples:
         "redacted_transcript": redacted_text,
         "pii_entities": pii_entities,
         "redacted_audio_s3_url": redacted_audio_s3_url,
-        "sentiment_analysis": sentiment_analysis_results,
         "full_transcript_content": transcript_content,
     }
 
@@ -1340,8 +1304,6 @@ Examples:
     print(f"   Original transcript length: {len(original_text)} characters")
     print(f"   Redacted transcript length: {len(redacted_text)} characters")
     print(f"   PII entities found: {len(pii_entities)}")
-    print(f"   Speaker segments analyzed: {len(sentiment_analysis_results)}")
-    print(f"   Sentiment analysis file: {sentiment_file}")
     print(f"   Original audio location: {s3_uri}")
     if redacted_audio_s3_url:
         print(f"   Redacted audio location: {redacted_audio_s3_url}")
