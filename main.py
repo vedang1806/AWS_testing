@@ -741,22 +741,94 @@ class GeminiSentimentAnalyzer:
     def merge_consecutive_segments(self, segments: List[Dict[str, Any]], max_gap: float = 2.0) -> List[Dict[str, Any]]:
         """
         Merge consecutive segments from the same speaker that are close together
+        Also fixes AWS Transcribe speaker diarization errors by detecting and merging
+        suspicious short segments that are clearly part of the same utterance.
 
         Args:
             segments: List of speaker segments
             max_gap: Maximum gap in seconds between segments to merge
 
         Returns:
-            List of merged segments
+            List of merged segments with corrected speaker labels
         """
         if not segments:
             return segments
 
-        merged = []
-        current_segment = segments[0].copy()
+        # First pass: Fix obvious speaker diarization errors
+        # Look for patterns where very short segments alternate speakers rapidly
+        fixed_segments = []
+        i = 0
+        while i < len(segments):
+            current = segments[i]
 
-        for i in range(1, len(segments)):
-            segment = segments[i]
+            # Look ahead for suspicious patterns (short segments with overlapping/close times)
+            if i + 1 < len(segments):
+                next_seg = segments[i + 1]
+
+                # Check if we have suspicious alternating short segments
+                # (less than 3 seconds duration, very close timestamps)
+                current_duration = current["end_time"] - current["start_time"]
+                next_duration = next_seg["end_time"] - next_seg["start_time"]
+                time_gap = next_seg["start_time"] - current["end_time"]
+
+                # If both segments are very short and very close together
+                if (current_duration < 3.0 and next_duration < 3.0 and
+                    time_gap <= 0.5 and current["speaker"] != next_seg["speaker"]):
+
+                    # Look for a cluster of such segments
+                    cluster = [current]
+                    j = i + 1
+                    while j < len(segments):
+                        seg = segments[j]
+                        seg_duration = seg["end_time"] - seg["start_time"]
+                        gap = seg["start_time"] - cluster[-1]["end_time"]
+
+                        if seg_duration < 3.0 and gap <= 0.5:
+                            cluster.append(seg)
+                            j += 1
+                        else:
+                            break
+
+                    # If we found a cluster (3+ short segments), merge them
+                    if len(cluster) >= 3:
+                        # Determine the correct speaker based on context
+                        # Use the speaker from the segment before the cluster
+                        if i > 0:
+                            correct_speaker = segments[i - 1]["speaker"]
+                        elif i + len(cluster) < len(segments):
+                            # Use the opposite of the next speaker
+                            next_speaker = segments[i + len(cluster)]["speaker"]
+                            correct_speaker = "spk_0" if next_speaker == "spk_1" else "spk_1"
+                        else:
+                            # Default to the first speaker in the cluster
+                            correct_speaker = cluster[0]["speaker"]
+
+                        # Merge the entire cluster
+                        merged_text = " ".join(seg["text"] for seg in cluster)
+                        merged_segment = {
+                            "speaker": correct_speaker,
+                            "text": merged_text.strip(),
+                            "start_time": cluster[0]["start_time"],
+                            "end_time": cluster[-1]["end_time"]
+                        }
+
+                        fixed_segments.append(merged_segment)
+                        i = j  # Skip past the cluster
+                        continue
+
+            # No cluster found, add segment as-is
+            fixed_segments.append(current)
+            i += 1
+
+        # Second pass: Merge consecutive segments from the same speaker
+        if not fixed_segments:
+            return []
+
+        merged = []
+        current_segment = fixed_segments[0].copy()
+
+        for i in range(1, len(fixed_segments)):
+            segment = fixed_segments[i]
 
             # Check if same speaker and within time gap
             if (segment["speaker"] == current_segment["speaker"] and
@@ -1247,6 +1319,41 @@ Examples:
     redacted_text = pii_redactor.redact_text(original_text, pii_entities)
 
     # Step 6.5: Extract speaker segments and analyze sentiment with Gemini
+    print("\n" + "="*80)
+    print("🎭 SENTIMENT ANALYSIS WITH GEMINI")
+    print("="*80)
+
+    # Extract speaker segments (with original text)
+    speaker_segments = gemini_analyzer.extract_speaker_segments(transcript_content)
+
+    # Merge consecutive segments from same speaker for better context
+    print(f"   Original segments: {len(speaker_segments)}")
+    merged_segments = gemini_analyzer.merge_consecutive_segments(speaker_segments, max_gap=2.0)
+    print(f"   Merged segments: {len(merged_segments)}")
+
+    # Analyze sentiment using original text, but output will have PII redacted
+    sentiment_analysis_results = gemini_analyzer.analyze_sentiment_with_gemini(
+        merged_segments,
+        full_transcript=original_text,
+        pii_entities=pii_entities
+    )
+
+    # Save sentiment analysis results to JSON file
+    sentiment_file = f"sentiment_analysis_{call_id}.json"
+    with open(sentiment_file, "w") as f:
+        json.dump(sentiment_analysis_results, f, indent=2)
+    print(f"\n✅ Sentiment analysis saved to: {sentiment_file}")
+
+    # Print preview of sentiment analysis
+    print(f"\n📊 Sentiment Analysis Preview (first 3 segments):")
+    for segment in sentiment_analysis_results[:3]:
+        print(f"\n   Order: {segment['order']}")
+        print(f"   Speaker: {segment['speaker']}")
+        print(f"   Text: {segment['text'][:100]}...")
+        print(f"   Time: {segment['start_time']} - {segment['end_time']}")
+        print(f"   Sentiment: {segment['sentiment']} (confidence: {segment['confidence']:.2f})")
+        print(f"   Tone: {segment['tone_note']}")
+
     # Step 7: Redact PII from audio
     redacted_audio_bytes = pii_redactor.redact_audio(
         audio_file,
@@ -1276,6 +1383,7 @@ Examples:
         "redacted_transcript": redacted_text,
         "pii_entities": pii_entities,
         "redacted_audio_s3_url": redacted_audio_s3_url,
+        "sentiment_analysis": sentiment_analysis_results,
         "full_transcript_content": transcript_content,
     }
 
@@ -1304,6 +1412,8 @@ Examples:
     print(f"   Original transcript length: {len(original_text)} characters")
     print(f"   Redacted transcript length: {len(redacted_text)} characters")
     print(f"   PII entities found: {len(pii_entities)}")
+    print(f"   Speaker segments analyzed: {len(sentiment_analysis_results)}")
+    print(f"   Sentiment analysis file: {sentiment_file}")
     print(f"   Original audio location: {s3_uri}")
     if redacted_audio_s3_url:
         print(f"   Redacted audio location: {redacted_audio_s3_url}")
