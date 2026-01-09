@@ -665,7 +665,7 @@ class GeminiSentimentAnalyzer:
     def __init__(self, api_key: str):
         """Initialize Gemini API client"""
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-pro')
+        self.model = genai.GenerativeModel('gemini-2.5-flash')
 
     def format_time(self, seconds: float) -> str:
         """Convert seconds to MM:SS format"""
@@ -1434,3 +1434,73 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
+
+def run_pipeline(audio_file_path: str, call_id: str):
+    """
+    Runs the full transcription + PII + sentiment pipeline
+    Returns results as a dictionary
+    """
+
+    transcriber = AWSTranscriber()
+    pii_redactor = PIIRedactor()
+    gemini_analyzer = GeminiSentimentAnalyzer(api_key=GEMINI_API_KEY)
+    s3_manager = S3Manager(
+        access_key=AWS_ACCESS_KEY_ID,
+        secret_key=AWS_SECRET_ACCESS_KEY,
+        bucket_name=AWS_S3_BUCKET_NAME,
+        region=AWS_S3_REGION,
+    )
+
+    # 1. Upload audio
+    s3_uri = transcriber.upload_audio_to_s3(audio_file_path, call_id)
+    if not s3_uri:
+        raise RuntimeError("Failed to upload audio")
+
+    # 2. Transcription
+    job_name = transcriber.submit_transcription(s3_uri, call_id)
+    job = transcriber.wait_for_completion(job_name)
+    transcript_content = transcriber.get_transcript_content(job)
+
+    results = transcript_content["results"]
+    original_text = results["transcripts"][0]["transcript"]
+
+    # 3. PII detection
+    pii_entities = pii_redactor.detect_pii_entities(original_text)
+    redacted_text = pii_redactor.redact_text(original_text, pii_entities)
+
+    # 4. Sentiment
+    segments = gemini_analyzer.extract_speaker_segments(transcript_content)
+    merged_segments = gemini_analyzer.merge_consecutive_segments(segments)
+
+    sentiment = gemini_analyzer.analyze_sentiment_with_gemini(
+        merged_segments,
+        full_transcript=original_text,
+        pii_entities=pii_entities
+    )
+
+    # 5. Audio redaction
+    redacted_audio = pii_redactor.redact_audio(
+        audio_file_path,
+        original_text,
+        pii_entities,
+        transcript_content=transcript_content,
+        redaction_mode="tone",
+    )
+
+    redacted_audio_url = None
+    if redacted_audio:
+        redacted_audio_url = s3_manager.upload_redacted_audio(
+            redacted_audio, call_id
+        )
+
+    transcriber.delete_transcription_job(job_name)
+
+    return {
+        "call_id": call_id,
+        "original_text": original_text,
+        "redacted_text": redacted_text,
+        "pii_entities": pii_entities,
+        "sentiment": sentiment,
+        "redacted_audio_url": redacted_audio_url,
+    }
