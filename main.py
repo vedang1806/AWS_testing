@@ -32,7 +32,7 @@ import requests
 from pydub import AudioSegment
 from pydub.generators import Sine
 import numpy as np
-import google.generativeai as genai
+import google.genai as genai
 
 # Load environment variables
 load_dotenv()
