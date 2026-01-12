@@ -43,7 +43,7 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_S3_BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME", "bpo-box-dev")
 AWS_S3_REGION = os.getenv("AWS_S3_REGION", "us-east-1")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "DEV")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # PII Entity Types to Detect (AWS Comprehend)
 PII_ENTITY_TYPES = [
