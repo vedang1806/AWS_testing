@@ -32,7 +32,7 @@ import requests
 from pydub import AudioSegment
 from pydub.generators import Sine
 import numpy as np
-import google.genai as genai
+import google.generativeai as genai
 
 # Load environment variables
 load_dotenv()
@@ -664,7 +664,8 @@ class GeminiSentimentAnalyzer:
 
     def __init__(self, api_key: str):
         """Initialize Gemini API client"""
-        genai.configure(api_key=api_key)
+        # Set API key via environment variable for new SDK
+        os.environ["GOOGLE_API_KEY"] = api_key
         self.model = genai.GenerativeModel('gemini-2.5-flash')
 
     def format_time(self, seconds: float) -> str:
