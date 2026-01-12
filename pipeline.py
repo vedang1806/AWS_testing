@@ -664,8 +664,7 @@ class GeminiSentimentAnalyzer:
 
     def __init__(self, api_key: str):
         """Initialize Gemini API client"""
-        # Set API key via environment variable for new SDK
-        os.environ["GOOGLE_API_KEY"] = api_key
+        genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-pro')
 
     def format_time(self, seconds: float) -> str:
